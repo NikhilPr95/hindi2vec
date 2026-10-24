@@ -10,6 +10,10 @@ Direct portal checks (see alerter/portal.py for the risks):
   python -m alerter.main --portal --login                # first time: sign in by hand, then one check
   python -m alerter.main --portal                        # one low-frequency check of the official portal
   python -m alerter.main --portal --inspect              # also dump HTML/screenshot to tune selectors
+
+Cheapest portal checks: record the page's own calendar request once, replay it later
+  python -m alerter.main --portal-api --capture          # sign in, pick posts, save portal-recipe.json
+  python -m alerter.main --portal-api                    # one POST per post/type, no page load
 """
 from __future__ import annotations
 
@@ -23,7 +27,7 @@ from pathlib import Path
 
 import yaml
 
-from .fetcher import DEFAULT_BASE, Sighting, fetch_all, parse_page
+from .fetcher import DEFAULT_BASE, Sighting, fetch_all, fetch_api, parse_page
 from .notify import Notifier, format_message, telegram_chat_ids
 from .rules import AlertRules, State, evaluate
 
@@ -63,10 +67,19 @@ def run_once(cfg: dict, notifier: Notifier, html_files: list[str] | None = None,
             slug = Path(path).stem
             sightings.extend(parse_page(Path(path).read_text(encoding="utf-8"), slug))
     else:
-        sightings, errors = fetch_all(
-            slugs_from_config(cfg), base=cfg["tracker_base"],
-            delay=float(cfg["request_delay_seconds"]),
-        )
+        sightings, errors = [], []
+        api_key = os.environ.get("CHECKVISASLOTS_API_KEY")
+        if api_key:
+            sightings, status = fetch_api(api_key)
+            if status != 200:
+                errors.append(f"checkvisaslots API returned HTTP {status}; falling back to the public pages")
+                sightings = []
+        if not sightings:
+            sightings, more = fetch_all(
+                slugs_from_config(cfg), base=cfg["tracker_base"],
+                delay=float(cfg["request_delay_seconds"]),
+            )
+            errors += more
 
     hits, skipped = evaluate(sightings, rules, state, now=now)
     stamp = now.strftime("%Y-%m-%d %H:%M UTC")
@@ -138,6 +151,69 @@ def run_portal(cfg: dict, notifier: Notifier, *, login: bool, inspect: bool,
     return 0
 
 
+def run_portal_api(cfg: dict, notifier: Notifier, *, capture: bool, with_entries: bool) -> int:
+    """Replay the portal's own schedule-days request. Returns 0 ok, 1 throttled, 2 failed."""
+    from .portal import Throttle
+    from .portal_api import RecipeBook, capture as do_capture, check
+
+    pcfg = cfg["portal"]
+    posts = pcfg.get("consular_posts") or ([pcfg["consular_post"]] if pcfg.get("consular_post") else [])
+    if not posts:
+        print("portal.consular_post(s) not set in config.yaml.", file=sys.stderr)
+        return 2
+    profile = Path(pcfg.get("profile_dir", ".portal-profile")).expanduser()
+    recipe_path = Path(pcfg.get("recipe_file", "portal-recipe.json"))
+    if capture or not recipe_path.exists():
+        print("capturing the portal's calendar request from your logged-in browser...")
+        book = do_capture(profile, recipe_path, post_labels=posts, headless=False)
+        print(f"saved {recipe_path}: posts={list(book.posts)} recipes={[r['kind'] for r in book.recipes]}")
+        if capture:
+            return 0
+    book = RecipeBook.load(recipe_path)
+
+    now = datetime.now(timezone.utc)
+    throttle = Throttle(cfg["state_file"], int(pcfg.get("max_checks_per_day", 6)))
+    if not throttle.allow(now):
+        print(f"portal: already checked {throttle.max_per_day}x today; skipping to avoid a lockout")
+        return 1
+    rules = AlertRules.from_dict(cfg["alert"])
+    deadline = rules.deadline(now.date())
+    kinds = [k for k, on in (("consular", rules.include_consulate), ("ofc", rules.include_vac)) if on]
+    prev_all = throttle.data["portal"].setdefault("api_previous", {})
+    lines, failed = [], False
+    for post in posts:
+        try:
+            results = check(profile, book, post, kinds=kinds, with_entries=with_entries,
+                            headless=bool(pcfg.get("headless_api", True)))
+        except Exception as e:
+            print(f"portal-api [{post}] failed: {e}", file=sys.stderr)
+            failed = True
+            continue
+        for r in results:
+            label = "consular interview" if r.kind == "consular" else "biometrics (VAC)"
+            print(f"portal-api [{post} {r.kind}] HTTP {r.status} dates={r.dates or 'none'} {r.note}")
+            if r.note:
+                failed = failed or r.status != 200
+                continue
+            good = [d for d in r.dates if not deadline or date.fromisoformat(d) <= deadline]
+            key = f"{post}|{r.kind}"
+            new = sorted(set(good) - set(prev_all.get(key, [])))
+            prev_all[key] = r.dates
+            if new:
+                extra = ""
+                if r.earliest_slots:
+                    extra = " (" + ", ".join(f"{t}: {n}" for t, n in r.earliest_slots[:4]) + ")"
+                lines.append(f"• {post.title()} — {label}: " + ", ".join(new) + extra)
+    throttle.record(now, None)
+    if lines:
+        text = "🛂 Official portal shows open dates\n" + "\n".join(lines) + \
+               "\n\nBook now: https://www.usvisascheduling.com/"
+        print(text)
+        for err in notifier.send(text, subject="US visa slot: official portal"):
+            print("  notify error:", err, file=sys.stderr)
+    return 2 if failed and not lines else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Alert when US visa slots in India appear on the tracker.")
     p.add_argument("--config", default=str(DEFAULT_CONFIG), help="path to config.yaml")
@@ -151,6 +227,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--login", action="store_true", help="with --portal: open a window so you can sign in by hand")
     p.add_argument("--inspect", action="store_true", help="with --portal: save HTML/screenshot/field dump for tuning")
     p.add_argument("--headless", action="store_true", help="with --portal: run the browser without a window")
+    p.add_argument("--portal-api", action="store_true", help="replay the portal's own calendar request (cheapest check)")
+    p.add_argument("--capture", action="store_true", help="with --portal-api: (re)record the request from a logged-in window")
+    p.add_argument("--with-times", action="store_true", help="with --portal-api: also fetch time slots for the earliest date")
     args = p.parse_args(argv)
 
     if args.telegram_chat_id:
@@ -181,6 +260,9 @@ def main(argv: list[str] | None = None) -> int:
     if not notifier.channels and not args.dry_run:
         print("warning: no notification channel configured; running in dry-run mode", file=sys.stderr)
         notifier.dry_run = True
+
+    if args.portal_api:
+        return run_portal_api(cfg, notifier, capture=args.capture, with_entries=args.with_times)
 
     if args.portal:
         return run_portal(cfg, notifier, login=args.login, inspect=args.inspect,

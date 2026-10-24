@@ -32,6 +32,9 @@ alert:
 # (needs a browser profile you signed in to), never on GitHub Actions.
 portal:
   consular_post: "HYDERABAD"     # exact label from the portal's consular-post dropdown
+  # consular_posts: [HYDERABAD, CHENNAI]   # --portal-api can check several posts per run
+  recipe_file: "portal-recipe.json"        # written by --portal-api --capture (contains your postIds; git-ignored)
+  headless_api: true             # --portal-api replays a request only; no window needed
   profile_dir: ".portal-profile" # persistent browser profile holding your login session
   max_checks_per_day: 6          # hard cap; the portal hides dates / locks accounts if polled
   headless: false                # keep a visible window; the portal is stricter with headless

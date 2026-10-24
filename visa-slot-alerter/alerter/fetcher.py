@@ -158,3 +158,78 @@ def fetch_all(slugs: Iterable[str], base: str = DEFAULT_BASE, delay: float = 2.0
         if i < len(slugs) - 1 and delay > 0:
             time.sleep(delay)
     return sightings, errors
+
+
+# ---------------------------------------------------------------------------
+# Optional JSON source: the checkvisaslots.com app API used by its extension.
+# GET https://app.checkvisaslots.com/slots/v3 with header x-api-key=<access code>
+# -> {"slotDetails": [{"visa_location": "HYDERABAD VAC", "createdon": "...",
+#                      "slots": 3, "start_date": "2026-11-05", ...}], "visa_type": ...}
+# The access code is the one the extension asks for; the API answers 429 for
+# accounts that have not contributed recently, in which case we fall back to
+# the public HTML pages.
+# ---------------------------------------------------------------------------
+API_BASE = "https://app.checkvisaslots.com"
+
+
+def _api_date(s: str) -> date | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%d %b, %y", "%d %b %Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s[:19] if "T" in s else s, fmt).date()
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def _api_datetime(s: str) -> datetime | None:
+    s = (s or "").strip()
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        d = parse_seen(s)
+        if not d:
+            return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def parse_api(payload, slug: str = "api") -> list[Sighting]:
+    rows = (payload or {}).get("slotDetails") if isinstance(payload, dict) else None
+    label = str((payload or {}).get("visa_type") or "").strip() if isinstance(payload, dict) else ""
+    out: list[Sighting] = []
+    for r in rows or []:
+        if not isinstance(r, dict) or not r.get("visa_location"):
+            continue
+        ed = _api_date(str(r.get("start_date") or r.get("earliest_date") or ""))
+        seen = _api_datetime(str(r.get("createdon") or ""))
+        if not ed or not seen:
+            continue
+        try:
+            n = int(r.get("slots") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        out.append(Sighting(
+            slug=slug, visa_label=r.get("visa_type") or label or slug,
+            location=re.sub(r"\s+", " ", str(r["visa_location"])).upper(),
+            earliest_date=ed.isoformat(), slots=None, total_dates=n,
+            seen_utc=seen.astimezone(timezone.utc).isoformat(),
+        ))
+    return out
+
+
+def fetch_api(api_key: str, session: requests.Session | None = None, timeout: int = 20) -> tuple[list[Sighting], int]:
+    """Returns (sightings, http_status). Raises nothing; a non-200 gives ([], status)."""
+    s = session or requests.Session()
+    r = s.get(f"{API_BASE}/slots/v3", headers={"x-api-key": api_key, "extVersion": "5.1.0",
+                                                "User-Agent": HEADERS["User-Agent"]}, timeout=timeout)
+    if r.status_code != 200:
+        return [], r.status_code
+    try:
+        return parse_api(r.json()), 200
+    except ValueError:
+        return [], 200

@@ -39,3 +39,16 @@ def test_date_parsers_tolerate_variants():
     assert parse_earliest("garbage") is None
     assert parse_seen("24 Oct 2026, 04:59 PM").isoformat() == "2026-10-24T16:59:00+00:00"
     assert parse_seen("nope") is None
+
+
+def test_parse_api_payload():
+    from alerter.fetcher import parse_api
+    payload = {"visa_type": "H-1B (Regular)", "slotDetails": [
+        {"visa_location": "HYDERABAD VAC", "createdon": "2026-10-24T16:59:00Z", "slots": 2, "start_date": "2026-11-13"},
+        {"visa_location": "CHENNAI", "createdon": "2026-10-24 11:36:00+00:00", "slots": "4", "start_date": "2026-11-03"},
+        {"visa_location": "", "createdon": "x"}, {"visa_location": "MUMBAI", "createdon": "", "start_date": ""},
+    ]}
+    rows = parse_api(payload)
+    assert [(r.location, r.earliest_date, r.total_dates, r.visa_label) for r in rows] == [
+        ("HYDERABAD VAC", "2026-11-13", 2, "H-1B (Regular)"), ("CHENNAI", "2026-11-03", 4, "H-1B (Regular)")]
+    assert rows[0].seen_utc == "2026-10-24T16:59:00+00:00"

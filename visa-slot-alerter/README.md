@@ -10,12 +10,13 @@ applies your rules (cities, date window, minimum slots) and notifies you once
 per new opening. Booking still happens by you, on the official portal
 <https://www.usvisascheduling.com/>.
 
-Two sources, used together:
+Three ways to get the data, used together:
 
-| Source | Frequency | Touches your account? | Section |
-|--------|-----------|-----------------------|---------|
-| checkvisaslots.com tracker (crowdsourced) | every 10 min, on GitHub Actions | no | 2 |
-| usvisascheduling.com portal (official, logged in) | a few times a day, on your PC | yes | 6 |
+| Source | How | Frequency | Touches your account? | Section |
+|--------|-----|-----------|-----------------------|---------|
+| checkvisaslots.com tracker (crowdsourced) | public HTML pages, or its JSON API with an access code | every 10 min, on GitHub Actions | no | 2 |
+| usvisascheduling.com, direct API replay | one POST to the portal's own calendar endpoint | a few times a day, on your PC | yes | 6 |
+| usvisascheduling.com, browser walk-through | Playwright drives the Reschedule page | fallback for the above | yes | 7 |
 
 The portal is known to hide availability for ~24 h after a handful of calendar
 refreshes and to lock accounts for ~72 h when it decides you are a bot, so the
@@ -113,6 +114,15 @@ Book now: https://www.usvisascheduling.com/
 Tracker: https://checkvisaslots.com/latest-us-visa-availability/h-1b-regular/
 ```
 
+### Optional: the tracker's JSON API instead of its HTML
+
+The checkvisaslots browser extension talks to `https://app.checkvisaslots.com/slots/v3`
+with an `x-api-key` header holding the access code you get when you register
+the extension. Set `CHECKVISASLOTS_API_KEY` (as an Actions secret or env var)
+and the alerter uses that JSON feed first, falling back to the public HTML
+pages on any non-200 (the API answers 429 for accounts that have not
+contributed slot screenshots recently).
+
 ## 5. Develop / test
 
 ```bash
@@ -125,7 +135,44 @@ python -m alerter.main --dry-run -v --html-file tests/fixtures/h-1b-regular.html
 If the tracker changes its page layout, only `alerter/fetcher.py` needs
 updating; the table parser falls back to a text-pattern scan.
 
-## 6. Direct checks on the official portal (optional, your machine only)
+## 6. Direct portal checks the efficient way: replay its own API call
+
+How the official portal works under the hood (learned from the browser
+extensions that read it): the *Reschedule Appointment* page has a
+`<select id="post_select">` of consular posts whose option values are the
+portal's internal post ids. Choosing a post fires an XHR `POST` to a URL
+containing `schedule-group/get-family-consular-schedule-days` (or `...-ofc-...`
+for biometrics) with a `parameters={"postId": ...}` form body, and the reply
+is plain JSON: `{"ScheduleDays": [{"Date": "2026-11-05"}, ...]}`. Clicking a
+date fires `...-schedule-entries` with `{"scheduleDate": ...}` and returns
+`{"ScheduleEntries": [{"Time": "09:00", "EntriesAvailable": 2}, ...]}`.
+
+So the cheapest possible check is one HTTP request per post. `--portal-api`
+does it in two phases:
+
+```bash
+pip install -r requirements-portal.txt && python -m playwright install chromium   # once
+# config.yaml -> portal.consular_post (or consular_posts: [HYDERABAD, CHENNAI])
+python -m alerter.main --portal-api --capture   # 1) window opens: sign in, it picks each post,
+                                                #    records the exact request -> portal-recipe.json
+python -m alerter.main --portal-api             # 2) replays it headlessly: ~1 s, no page load
+python -m alerter.main --portal-api --with-times   # also pull time slots for the earliest date
+```
+
+The replay runs inside the same persistent browser profile, so the session
+cookies and anti-forgery token the page used are reused untouched. When the
+session expires (HTML/redirect instead of JSON) the run says so; re-run
+`--capture`. The daily cap `portal.max_checks_per_day` still applies: the
+server counts these calls exactly like clicks in the UI, and the 24 h
+"no availability" penalty and the 72 h lockout are enforced server-side.
+
+Not verified live: I could not log in to a real account from here. The
+request matching, body shape and response parsing come from three production
+extensions that intercept the same calls, so the capture should work
+unchanged; if `--capture` reports "no schedule-days request observed", send
+me the output and the saved `portal-dumps/` files.
+
+## 7. Direct checks by walking the portal UI (fallback)
 
 `alerter/portal.py` drives a real Chromium window with Playwright and a
 persistent profile. You sign in by hand once (Cloudflare check, captcha,
