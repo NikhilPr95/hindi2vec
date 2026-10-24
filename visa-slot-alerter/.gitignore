@@ -2,3 +2,5 @@ state.json
 state.json.tmp
 __pycache__/
 .pytest_cache/
+.portal-profile/
+portal-dumps/

@@ -5,14 +5,20 @@
   python -m alerter.main --config config.yaml --dry-run  # print instead of sending
   python -m alerter.main --test-notify                   # send a hello to every channel
   python -m alerter.main --telegram-chat-id              # discover your Telegram chat id
+
+Direct portal checks (see alerter/portal.py for the risks):
+  python -m alerter.main --portal --login                # first time: sign in by hand, then one check
+  python -m alerter.main --portal                        # one low-frequency check of the official portal
+  python -m alerter.main --portal --inspect              # also dump HTML/screenshot to tune selectors
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -32,6 +38,7 @@ def load_config(path: str | os.PathLike) -> dict:
     cfg.setdefault("state_file", "state.json")
     cfg.setdefault("request_delay_seconds", 2)
     cfg.setdefault("alert", {})
+    cfg.setdefault("portal", {})
     return cfg
 
 
@@ -86,6 +93,51 @@ def run_once(cfg: dict, notifier: Notifier, html_files: list[str] | None = None,
     return len(hits)
 
 
+def run_portal(cfg: dict, notifier: Notifier, *, login: bool, inspect: bool,
+               headless: bool | None) -> int:
+    """One pass over the official portal. Returns 0 ok, 1 skipped/throttled, 2 failed."""
+    from .portal import Throttle, check_portal
+
+    pcfg = cfg["portal"]
+    post = pcfg.get("consular_post")
+    if not post:
+        print("portal.consular_post is not set in config.yaml (e.g. \"HYDERABAD\").", file=sys.stderr)
+        return 2
+    now = datetime.now(timezone.utc)
+    throttle = Throttle(cfg["state_file"], int(pcfg.get("max_checks_per_day", 6)))
+    if not login and not throttle.allow(now):
+        print(f"portal: already checked {throttle.max_per_day}x today; skipping to avoid a lockout")
+        return 1
+
+    profile = Path(pcfg.get("profile_dir", ".portal-profile")).expanduser()
+    if headless is None:
+        headless = bool(pcfg.get("headless", False)) and not login
+    inspect_dir = Path(pcfg.get("inspect_dir", "portal-dumps")) if inspect else None
+    result = check_portal(profile, post, interactive=login, headless=headless, inspect_dir=inspect_dir)
+    throttle.record(now, result)
+
+    rules = AlertRules.from_dict(cfg["alert"])
+    deadline = rules.deadline(now.date())
+    good = [d for d in result.available_dates if not deadline or date.fromisoformat(d) <= deadline]
+    print(f"portal [{post}] {result.checked_at[:16]}: dates={result.available_dates or 'none'} "
+          f"{('note: ' + result.note) if result.note else ''}")
+    if result.note == "not logged in":
+        return 2
+
+    prev = (throttle.data["portal"].get("previous_dates") or [])
+    throttle.data["portal"]["previous_dates"] = result.available_dates
+    throttle.path.write_text(json.dumps(throttle.data, indent=2, sort_keys=True))
+    new = sorted(set(good) - set(prev))
+    if new:
+        text = ("🛂 Official portal shows open dates\n"
+                f"• {post.title()}: " + ", ".join(new) + "\n\n"
+                f"Book now: https://www.usvisascheduling.com/")
+        print(text)
+        for err in notifier.send(text, subject="US visa slot: official portal"):
+            print("  notify error:", err, file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Alert when US visa slots in India appear on the tracker.")
     p.add_argument("--config", default=str(DEFAULT_CONFIG), help="path to config.yaml")
@@ -95,6 +147,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--html-file", action="append", help="parse a saved tracker page instead of fetching (file stem = slug)")
     p.add_argument("--test-notify", action="store_true", help="send a test message to every configured channel")
     p.add_argument("--telegram-chat-id", action="store_true", help="print chat ids that messaged your bot")
+    p.add_argument("--portal", action="store_true", help="check the official usvisascheduling.com portal (low frequency!)")
+    p.add_argument("--login", action="store_true", help="with --portal: open a window so you can sign in by hand")
+    p.add_argument("--inspect", action="store_true", help="with --portal: save HTML/screenshot/field dump for tuning")
+    p.add_argument("--headless", action="store_true", help="with --portal: run the browser without a window")
     args = p.parse_args(argv)
 
     if args.telegram_chat_id:
@@ -125,6 +181,10 @@ def main(argv: list[str] | None = None) -> int:
     if not notifier.channels and not args.dry_run:
         print("warning: no notification channel configured; running in dry-run mode", file=sys.stderr)
         notifier.dry_run = True
+
+    if args.portal:
+        return run_portal(cfg, notifier, login=args.login, inspect=args.inspect,
+                          headless=True if args.headless else None)
 
     if not args.loop:
         return 1 if run_once(cfg, notifier, args.html_file, args.verbose) < 0 else 0

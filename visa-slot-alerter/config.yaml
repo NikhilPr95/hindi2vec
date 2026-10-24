@@ -26,3 +26,13 @@ alert:
 
   max_sighting_age_minutes: 90   # ignore tracker rows last seen longer ago than this
   renotify_after_minutes: 180    # same date still open? remind again after this long
+
+# Optional: check the official portal directly (python -m alerter.main --portal).
+# Read the warning at the top of alerter/portal.py first. Runs on YOUR machine
+# (needs a browser profile you signed in to), never on GitHub Actions.
+portal:
+  consular_post: "HYDERABAD"     # exact label from the portal's consular-post dropdown
+  profile_dir: ".portal-profile" # persistent browser profile holding your login session
+  max_checks_per_day: 6          # hard cap; the portal hides dates / locks accounts if polled
+  headless: false                # keep a visible window; the portal is stricter with headless
+  inspect_dir: "portal-dumps"    # where --inspect saves HTML / screenshots

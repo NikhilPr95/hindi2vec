@@ -10,12 +10,17 @@ applies your rules (cities, date window, minimum slots) and notifies you once
 per new opening. Booking still happens by you, on the official portal
 <https://www.usvisascheduling.com/>.
 
-**Why not log in to usvisascheduling.com and poll it directly?** The portal
-locks accounts for ~72 hours when it sees repeated automated checks, which is
-the last thing you want while hunting a slot. Reading the tracker never touches
-your account. If you *also* want first-hand data, install the free
-[checkvisaslots browser extension](https://checkvisaslots.com/) and log in
-manually; your own views feed the same tracker.
+Two sources, used together:
+
+| Source | Frequency | Touches your account? | Section |
+|--------|-----------|-----------------------|---------|
+| checkvisaslots.com tracker (crowdsourced) | every 10 min, on GitHub Actions | no | 2 |
+| usvisascheduling.com portal (official, logged in) | a few times a day, on your PC | yes | 6 |
+
+The portal is known to hide availability for ~24 h after a handful of calendar
+refreshes and to lock accounts for ~72 h when it decides you are a bot, so the
+direct checker is deliberately low-frequency and the tracker does the fast
+polling.
 
 ## 1. Pick a notification channel
 
@@ -120,6 +125,45 @@ python -m alerter.main --dry-run -v --html-file tests/fixtures/h-1b-regular.html
 If the tracker changes its page layout, only `alerter/fetcher.py` needs
 updating; the table parser falls back to a text-pattern scan.
 
+## 6. Direct checks on the official portal (optional, your machine only)
+
+`alerter/portal.py` drives a real Chromium window with Playwright and a
+persistent profile. You sign in by hand once (Cloudflare check, captcha,
+security questions, OTP are never automated), and each later run does exactly
+one pass: home → *Reschedule Appointment* → pick your consular post → read the
+calendar → close. It never selects applicants, submits or books.
+
+```bash
+pip install -r requirements-portal.txt
+python -m playwright install chromium          # once
+# edit config.yaml -> portal.consular_post (exact dropdown label, e.g. HYDERABAD)
+python -m alerter.main --portal --login        # window opens; sign in; it then checks once
+python -m alerter.main --portal                # later runs reuse the saved session
+python -m alerter.main --portal --inspect      # saves HTML + screenshot to portal-dumps/
+```
+
+Safety rails
+- `portal.max_checks_per_day` (default 6) is enforced through `state.json`;
+  extra runs are skipped. Keep it low: the 24 h "no availability" hide-out
+  reportedly kicks in after 3–5 refreshes.
+- Schedule it with cron / Task Scheduler at most every few hours, e.g.
+  `0 7,10,13,16,19,22 * * *`, on a machine where the browser window can open.
+- Do **not** run it on GitHub Actions: no saved session, data-centre IPs are
+  blocked, and headless browsers trip the bot check.
+- The profile directory holds your logged-in session; it is git-ignored.
+  Never commit it or share it.
+
+Calibration: the sign-in form, queue page, menu link and post dropdown
+selectors come from a project that verified them against the live site; the
+calendar reader tries several common date-picker layouts but has not been
+checked against a live account. If a run reports "no selectable dates found",
+run once with `--inspect` and adjust `CALENDAR_SELECTORS` in
+`alerter/portal.py` using the saved HTML.
+
+Alerts from the portal are separate from tracker alerts: you get one when a
+date appears that was not in the previous portal check and that is inside your
+`alert` date window.
+
 ## Caveats
 
 - The tracker is crowdsourced: an opening shows up only after someone with the
@@ -127,4 +171,7 @@ updating; the table parser falls back to a text-pattern scan.
   the official portal logged in on your phone so you can book within seconds.
 - Both VAC (biometrics) and consulate (interview) appointments are needed for a
   regular H-1B; the VAC date must be before the interview date.
-- Nothing here logs in to, scrapes, or books on usvisascheduling.com.
+- The tracker checker never touches usvisascheduling.com. The optional portal
+  checker logs in with *your* saved browser session, reads one calendar, and
+  never books. Automating the portal may be against its terms of use; you take
+  that risk knowingly, and the lockout is real.
