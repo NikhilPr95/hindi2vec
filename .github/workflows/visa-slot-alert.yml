@@ -1,0 +1,75 @@
+name: US visa slot alert
+
+on:
+  schedule:
+    # Every 10 minutes (GitHub may delay scheduled runs by a few minutes).
+    # Private repos: use "*/30 * * * *" to stay inside the free Actions minutes.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_notify:
+        description: "Send a test message to every configured channel instead of checking"
+        type: boolean
+        default: false
+
+# Never let two checks overlap (they would race on state.json).
+concurrency:
+  group: visa-slot-alert
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # needed to save the state cache
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: visa-slot-alerter
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
+      NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: visa-slot-alerter/requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Send test notification
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_notify }}
+        run: python -m alerter.main --test-notify
+
+      - name: Restore alert memory
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test_notify) }}
+        uses: actions/cache/restore@v4
+        with:
+          path: visa-slot-alerter/state.json
+          key: visa-slot-state-${{ github.run_id }}
+          restore-keys: visa-slot-state-
+
+      - name: Check tracker and alert
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test_notify) }}
+        run: python -m alerter.main --config config.yaml --verbose
+
+      - name: Save alert memory
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.test_notify) }}
+        uses: actions/cache/save@v4
+        with:
+          path: visa-slot-alerter/state.json
+          key: visa-slot-state-${{ github.run_id }}

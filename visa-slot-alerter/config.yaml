@@ -1,0 +1,28 @@
+# What to watch. Slugs are the last path segment of
+# https://checkvisaslots.com/latest-us-visa-availability/<slug>/
+visa_types:
+  - h-1b-regular            # fresh H-1B stamping: consular interview + VAC biometrics
+  # - h-1b-interview-waiver # "dropbox" renewals, if you qualify
+  # - h-4-regular           # dependants
+
+# Where the per-run memory lives (what was already alerted). The GitHub
+# Actions workflow caches this file between runs.
+state_file: state.json
+request_delay_seconds: 2
+
+alert:
+  # Cities to watch. Leave empty ([]) for all five posts.
+  locations: [HYDERABAD, CHENNAI, MUMBAI, NEW DELHI, KOLKATA]
+  include_consulate: true      # interview appointments at the consulate
+  include_vac: true            # biometrics / OFC appointments ("... VAC" rows)
+
+  # Only alert if the earliest date is on/before this (ISO date) ...
+  earliest_on_or_before: null  # e.g. "2027-01-31"
+  # ... and/or within this many days of today. Both null = any date.
+  within_days: 120
+
+  min_slots: 1                 # consulate rows show a count; VAC rows usually N/A
+  allow_unknown_slots: true    # keep N/A rows (set false to only alert on counted slots)
+
+  max_sighting_age_minutes: 90   # ignore tracker rows last seen longer ago than this
+  renotify_after_minutes: 180    # same date still open? remind again after this long
